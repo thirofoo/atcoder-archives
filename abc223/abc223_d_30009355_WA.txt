@@ -1,0 +1,52 @@
+/*
+ * Author: through
+ * Submission URL: https://atcoder.jp/contests/abc223/submissions/30009355
+ * Submitted at: 2022-03-11 23:19:48
+ * Problem URL: https://atcoder.jp/contests/abc223/tasks/abc223_d
+ * Result: WA
+ * Execution Time: 8 ms
+ */
+
+#include <bits/stdc++.h>
+using namespace std;
+#if __has_include(<atcoder/all>)
+    #include <atcoder/all>
+using namespace atcoder;
+#endif
+typedef long long ll;
+typedef pair<int, int> P;
+typedef tuple<int, int, int> T;
+#define rep(i, n) for(ll i = 0; i < n; i++)
+
+int main() {
+    int n,m; cin >> n >> m;
+    vector<vector<int>> Graph(n);
+    vector<int> indegree(n,0);
+    rep(i,m){
+        int a,b; cin >> a >> b;
+        a--; b--;
+        Graph[a].push_back(b);
+        indegree[b]++;
+    }
+    priority_queue<int,vector<int>,greater<int>> todo;
+    rep(i,n){
+        if(indegree[i] == 0)todo.push(i);
+    }
+
+    vector<int> ans;
+    while(!todo.empty()){
+        int tmp = todo.top(); todo.pop();
+        ans.push_back(tmp);
+        for(auto k:Graph[tmp]){
+            indegree[k]--;
+            if(indegree[k] == 0)todo.push(k);
+        }
+    }
+    if(ans.size() != n)cout << -1 << endl;
+    else{
+        rep(i,ans.size())cout << ans[i]+1 << " ";
+        cout << endl;
+    }
+
+    return 0;
+}
