@@ -1,0 +1,10 @@
+/*
+ * Author: through
+ * Submission URL: https://atcoder.jp/contests/iroha2019-day3/submissions/30007105
+ * Submitted at: 2022-03-11 21:43:14
+ * Problem URL: https://atcoder.jp/contests/iroha2019-day3/tasks/iroha2019_day3_j
+ * Result: WA
+ * Execution Time: 7 ms
+ */
+
+Judgement
