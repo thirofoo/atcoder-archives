@@ -1,0 +1,933 @@
+/*
+ * Author: through
+ * Submission URL: https://atcoder.jp/contests/ahc066/submissions/76404561
+ * Submitted at: 2026-06-05 18:28:15
+ * Problem URL: https://atcoder.jp/contests/ahc066/tasks/ahc066_a
+ * Result: AC
+ * Execution Time: 1855 ms
+ */
+
+#include <bits/stdc++.h>
+#pragma GCC optimize("Ofast,omit-frame-pointer,inline,unroll-all-loops,no-stack-protector")
+using namespace std;
+
+#define rep(i, n) for (int i = 0; i < (int)(n); i++)
+
+const double TIME_LIMIT_MS = 2000.0;
+const double MARGIN_MS = 150.0;
+const double PH_MACRO =  3.0;
+const double PH_ORDER =  1.0;
+const int MACRO_MIN_LEN = 3, MACRO_MAX_LEN = 40;
+const int MACRO_KICK_STALL = 20;  // ILS macro search: non-improving probes before a kick
+const int MACRO_KICK_LO = 3, MACRO_KICK_SPAN = 4;  // kick strength = LO + rand()%SPAN mutations
+const int PROXY_TOUR_PASSES = 6;  // proxy tour: swap hill-climb passes
+const int LARGE_TOPK = 8;  // large M: # macros from one ILS search to exact-build best-of
+const int MAX_EXACT_M = 13;  // M <= this: proxy top-K macros -> exact Held-Karp, best-of
+const double EXACT_PROXY_FRAC = 0.8;  // fraction of time for phase A (proxy scoring)
+const int EXACT_TOPK = 100;      // # provisional-best macros to exact-solve in phase B
+const int SMALL_MACRO_MIN_LEN = 3, SMALL_MACRO_MAX_LEN = 20;  // macro length bounds for small M
+const double ORDER_T0 = 20.0, ORDER_T1 = 0.2;
+
+struct Timer {
+  chrono::steady_clock::time_point st = chrono::steady_clock::now();
+  double ms() const {
+    return chrono::duration<double, milli>(chrono::steady_clock::now() - st).count();
+  }
+};
+
+struct Pos {
+  int r, c;
+};
+
+struct Cost {
+  int ops, turns;
+};
+
+bool better_cost(const Cost &a, const Cost &b) {
+  if (a.ops != b.ops) return a.ops < b.ops;
+  return a.turns < b.turns;
+}
+
+Cost add_cost(Cost a, Cost b) {
+  return {a.ops + b.ops, a.turns + b.turns};
+}
+
+const int INF = 1e9;
+const int DR[4] = {-1, 0, 1, 0};
+const int DC[4] = {0, 1, 0, -1};
+
+int N, M, T, V;
+vector<string> vw, hw;
+vector<Pos> ball, basket;
+vector<vector<Cost>> dist_all;
+vector<vector<int>> parent_state;
+vector<vector<char>> parent_op;
+
+uint32_t rng_state = 123456789;
+uint32_t rnd() {
+  rng_state ^= rng_state << 13;
+  rng_state ^= rng_state >> 17;
+  rng_state ^= rng_state << 5;
+  return rng_state;
+}
+
+double rand01() {
+  return (rnd() + 0.5) / 4294967296.0;
+}
+
+int cell_id(Pos p) {
+  return p.r * N + p.c;
+}
+
+int state_id(int cell, int dir) {
+  return cell * 4 + dir;
+}
+
+bool can_move(int cell, int dir) {
+  int r = cell / N, c = cell % N;
+  int nr = r + DR[dir], nc = c + DC[dir];
+  if (nr < 0 || nr >= N || nc < 0 || nc >= N) return false;
+  if (dir == 0) return hw[r - 1][c] == '0';
+  if (dir == 1) return vw[r][c] == '0';
+  if (dir == 2) return hw[r][c] == '0';
+  return vw[r][c - 1] == '0';
+}
+
+vector<int> move_tbl;
+
+string g_macro;
+vector<int> macroF;
+int macroLen = 0;
+
+void build_macro_f() {
+  macroLen = g_macro.size();
+  if ((int)macroF.size() != N * N * 4) macroF.resize(N * N * 4);  // overwritten fully below; no zero-fill
+  rep(cell, N * N) rep(dir, 4) {
+    int cc = cell, dd = dir;
+    for (char op : g_macro) {
+      if (op == 'F') cc = move_tbl[cc * 4 + dd];
+      else if (op == 'R') dd = (dd + 1) % 4;
+      else dd = (dd + 3) % 4;
+    }
+    macroF[cell * 4 + dir] = cc * 4 + dd;
+  }
+}
+
+int moved_cell_raw(int cell, int dir) {
+  if (!can_move(cell, dir)) return cell;
+  int r = cell / N, c = cell % N;
+  return (r + DR[dir]) * N + (c + DC[dir]);
+}
+
+vector<int> nbr3;  // nbr3[s*3 + {0,1,2}] = L / R / F neighbour state (F = s itself if blocked)
+
+void build_move_table() {
+  move_tbl.assign(N * N * 4, 0);
+  rep(cell, N * N) rep(dir, 4) move_tbl[cell * 4 + dir] = moved_cell_raw(cell, dir);
+  int Vn = N * N * 4;
+  nbr3.assign(Vn * 3, 0);
+  rep(s, Vn) {
+    int dir = s & 3, base = s - dir;
+    nbr3[s * 3 + 0] = base + ((dir + 3) & 3);  // L
+    nbr3[s * 3 + 1] = base + ((dir + 1) & 3);  // R
+    nbr3[s * 3 + 2] = move_tbl[s] * 4 + dir;   // F (self if blocked)
+  }
+}
+
+vector<int> bseen, bq;  // reused BFS buffers (stamp marks visited, so no V*V reset)
+int bstamp = 0;
+
+void build_required_paths() {
+  V = N * N * 4;
+  if ((int)dist_all.size() != V) {  // allocate once, reuse across all calls
+    dist_all.assign(V, vector<Cost>(V, {INF, INF}));
+    parent_state.assign(V, vector<int>(V, -1));
+    parent_op.assign(V, vector<char>(V, 0));
+    bseen.assign(V, 0);
+    bq.assign(V, 0);
+  }
+
+  vector<int> sources;
+  vector<char> seen(V, 0);
+  auto add_cell_sources = [&](int cell) {
+    rep(d, 4) {
+      int s = state_id(cell, d);
+      if (!seen[s]) { seen[s] = 1; sources.push_back(s); }
+    }
+  };
+  add_cell_sources(0);
+  rep(i, M) {
+    add_cell_sources(cell_id(ball[i]));
+    add_cell_sources(cell_id(basket[i]));
+  }
+
+  const char opc[4] = {'L', 'R', 'F', 'P'};
+  for (int src : sources) {
+    Cost *dist = dist_all[src].data();
+    int *par = parent_state[src].data();
+    char *pop = parent_op[src].data();
+    ++bstamp;
+    bseen[src] = bstamp;
+    dist[src] = {0, 0};
+    int head = 0, tail = 0;
+    bq[tail++] = src;
+    while (head < tail) {
+      int cur = bq[head++];
+      Cost cc = dist[cur];
+      const int *nb = &nbr3[cur * 3];
+      int outs[4] = {nb[0], nb[1], nb[2], macroLen > 0 ? macroF[cur] : cur};
+      int cnt = macroLen > 0 ? 4 : 3;
+      rep(i, cnt) {
+        int nxt = outs[i];
+        if (bseen[nxt] == bstamp) continue;
+        bseen[nxt] = bstamp;
+        dist[nxt] = {cc.ops + 1, cc.turns + (i == 3 ? macroLen : 1)};
+        par[nxt] = cur;
+        pop[nxt] = opc[i];
+        bq[tail++] = nxt;
+      }
+    }
+  }
+}
+
+Cost move_cost(int from_cell, int from_dir, int to_cell, int to_dir) {
+  return dist_all[state_id(from_cell, from_dir)][state_id(to_cell, to_dir)];
+}
+
+int CK;
+vector<int64_t> cpacked;
+vector<int> ball_idx, basket_idx;
+int start_idx;
+const int64_t PACK_BIG = (int64_t)INF << 32;
+
+inline int64_t pack_cost(Cost c) { return ((int64_t)c.ops << 32) | (uint32_t)c.turns; }
+
+void build_compact_costs() {
+  vector<int> cells;
+  vector<int> cidx(N * N, -1);
+  auto add = [&](int cell) {
+    if (cidx[cell] == -1) {
+      cidx[cell] = cells.size();
+      cells.push_back(cell);
+    }
+  };
+  add(0);
+  rep(i, M) {
+    add(cell_id(ball[i]));
+    add(cell_id(basket[i]));
+  }
+  CK = cells.size();
+  start_idx = cidx[0];
+  ball_idx.resize(M);
+  basket_idx.resize(M);
+  rep(i, M) {
+    ball_idx[i] = cidx[cell_id(ball[i])];
+    basket_idx[i] = cidx[cell_id(basket[i])];
+  }
+  cpacked.assign((size_t)CK * CK * 16, PACK_BIG);
+  rep(a, CK) rep(b, CK) {
+    int ca = cells[a], cb = cells[b];
+    size_t base = ((size_t)(a * CK + b)) * 16;
+    rep(da, 4) rep(db, 4) {
+      cpacked[base + da * 4 + db] = pack_cost(dist_all[state_id(ca, da)][state_id(cb, db)]);
+    }
+  }
+}
+
+// One job step of the order DP: dp[pd] (facing pd at prev cell) -> out[cd] (facing cd
+// at the basket of job k), via ball k. Reads the macro-augmented cpacked distances.
+inline void step_job(const int64_t *dp, int prev, int k, int64_t *out) {
+  int bi = ball_idx[k], ci = basket_idx[k];
+  const int64_t *pb = &cpacked[((size_t)(prev * CK + bi)) * 16];
+  int64_t toball[4] = {PACK_BIG, PACK_BIG, PACK_BIG, PACK_BIG};
+  rep(pd, 4) {
+    int64_t base = dp[pd];
+    if (base >= PACK_BIG) continue;
+    const int64_t *row = pb + pd * 4;
+    rep(bd, 4) { int64_t v = base + row[bd]; if (v < toball[bd]) toball[bd] = v; }
+  }
+  const int64_t *bc = &cpacked[((size_t)(bi * CK + ci)) * 16];
+  int64_t nd[4] = {PACK_BIG, PACK_BIG, PACK_BIG, PACK_BIG};
+  rep(bd, 4) {
+    int64_t base = toball[bd];
+    if (base >= PACK_BIG) continue;
+    const int64_t *row = bc + bd * 4;
+    rep(cd, 4) { int64_t v = base + row[cd]; if (v < nd[cd]) nd[cd] = v; }
+  }
+  const int64_t add2 = (int64_t)2 << 32;
+  rep(d, 4) out[d] = nd[d] < PACK_BIG ? nd[d] + add2 : PACK_BIG;
+}
+
+inline Cost dp_min(const int64_t *last) {
+  int64_t b = last[0];
+  rep(d, 4) if (last[d] < b) b = last[d];
+  return {(int)(b >> 32), (int)(b & 0xffffffffLL)};
+}
+
+struct EvalResult {
+  Cost cost;
+  vector<array<int, 2>> dirs;
+};
+
+EvalResult evaluate_order(const vector<int> &order, bool keep_dirs) {
+  vector<Cost> dp(4, {INF, INF}), ndp(4, {INF, INF});
+  vector<array<int, 4>> prev_dir(M), pickup_dir(M);
+
+  int prev_cell = 0;
+  dp[1] = {0, 0};
+
+  rep(i, M) {
+    fill(ndp.begin(), ndp.end(), Cost{INF, INF});
+    int k = order[i];
+    int bcell = cell_id(ball[k]);
+    int ccell = cell_id(basket[k]);
+
+    rep(pd, 4) {
+      if (dp[pd].ops >= INF) continue;
+      rep(bd, 4) rep(cd, 4) {
+        Cost c = add_cost(dp[pd], move_cost(prev_cell, pd, bcell, bd));
+        c = add_cost(c, move_cost(bcell, bd, ccell, cd));
+        c.ops += 2;
+        if (better_cost(c, ndp[cd])) {
+          ndp[cd] = c;
+          if (keep_dirs) {
+            prev_dir[i][cd] = pd;
+            pickup_dir[i][cd] = bd;
+          }
+        }
+      }
+    }
+
+    dp.swap(ndp);
+    prev_cell = ccell;
+  }
+
+  int best_dir = 0;
+  rep(d, 4) {
+    if (better_cost(dp[d], dp[best_dir])) best_dir = d;
+  }
+
+  vector<array<int, 2>> dirs;
+  if (keep_dirs) {
+    dirs.assign(M, {-1, -1});
+    int cd = best_dir;
+    for (int i = M - 1; i >= 0; i--) {
+      dirs[i] = {pickup_dir[i][cd], cd};
+      cd = prev_dir[i][cd];
+    }
+  }
+  return {dp[best_dir], dirs};
+}
+
+string restore_path(int src, int dst) {
+  string ops;
+  for (int cur = dst; cur != src; cur = parent_state[src][cur]) {
+    ops.push_back(parent_op[src][cur]);
+  }
+  reverse(ops.begin(), ops.end());
+  return ops;
+}
+
+string build_raw_answer(const vector<int> &order) {
+  EvalResult ev = evaluate_order(order, true);
+  string ans;
+  int prev_cell = 0, prev_dir = 1;
+
+  rep(i, M) {
+    int k = order[i];
+    int bcell = cell_id(ball[k]);
+    int ccell = cell_id(basket[k]);
+    int bd = ev.dirs[i][0];
+    int cd = ev.dirs[i][1];
+
+    ans += restore_path(state_id(prev_cell, prev_dir), state_id(bcell, bd));
+    ans += 'S';
+    ans += restore_path(state_id(bcell, bd), state_id(ccell, cd));
+    ans += 'S';
+
+    prev_cell = ccell;
+    prev_dir = cd;
+  }
+
+  return ans;
+}
+
+vector<int> greedy_order() {
+  vector<int> order;
+  vector<char> used(M, 0);
+  int cur_cell = 0, cur_dir = 1;
+
+  rep(_, M) {
+    int best_k = -1;
+    int best_cd = 0;
+    Cost best{INF, INF};
+    rep(k, M) {
+      if (used[k]) continue;
+      int bcell = cell_id(ball[k]);
+      int ccell = cell_id(basket[k]);
+      rep(bd, 4) rep(cd, 4) {
+        Cost c = add_cost(move_cost(cur_cell, cur_dir, bcell, bd), move_cost(bcell, bd, ccell, cd));
+        c.ops += 2;
+        if (better_cost(c, best)) {
+          best = c;
+          best_k = k;
+          best_cd = cd;
+        }
+      }
+    }
+    used[best_k] = 1;
+    order.push_back(best_k);
+    cur_cell = cell_id(basket[best_k]);
+    cur_dir = best_cd;
+  }
+  return order;
+}
+
+double score_value(Cost c) {
+  return c.ops + c.turns * 0.001;
+}
+
+void optimize_order(vector<int> &order, const Timer &timer, double end_ms) {
+  // Prefix DP cache: dp[i] = facing state after the first i jobs of `order`.
+  // A neighbour changes the order only from index `lo` on, so we recompute the DP
+  // suffix from dp[lo] (the prefix is untouched). lo comes O(1) from the move type.
+  vector<array<int64_t, 4>> dp(M + 1), td(M + 1);
+  dp[0] = {PACK_BIG, 0, PACK_BIG, PACK_BIG};  // start cell, facing east (dir 1)
+  {
+    int prev = start_idx;
+    rep(i, M) { step_job(dp[i].data(), prev, order[i], dp[i + 1].data()); prev = basket_idx[order[i]]; }
+  }
+  Cost cur = dp_min(dp[M].data());
+  Cost best = cur;
+  vector<int> best_order = order, cand;
+  const double start_ms = timer.ms();
+
+  double temp = ORDER_T0;
+  uint32_t iter = 0;
+  while (true) {
+    if ((iter++ & 255) == 0) {
+      double now = timer.ms();
+      if (now >= end_ms) break;
+      double progress = (now - start_ms) / max(1.0, end_ms - start_ms);
+      temp = ORDER_T0 * pow(ORDER_T1 / ORDER_T0, progress);
+    }
+
+    cand = order;
+    int type = rnd() % 4, lo;
+    if (type == 0) {  // swap two jobs
+      int i = rnd() % M, j = rnd() % M;
+      if (i == j) continue;
+      swap(cand[i], cand[j]);
+      lo = min(i, j);
+    } else if (type == 1) {  // move one job
+      int i = rnd() % M, j = rnd() % M;
+      if (i == j) continue;
+      int x = cand[i];
+      cand.erase(cand.begin() + i);
+      if (j > i) j--;
+      cand.insert(cand.begin() + j, x);
+      lo = min(i, j);
+    } else if (type == 2) {  // reverse a segment
+      int i = rnd() % M, j = rnd() % M;
+      if (i == j) continue;
+      if (i > j) swap(i, j);
+      reverse(cand.begin() + i, cand.begin() + j + 1);
+      lo = i;
+    } else {  // Or-opt: move a short contiguous block
+      int len = 2 + rnd() % 2;
+      if (M - len < 2) continue;
+      int i = rnd() % (M - len + 1), j = rnd() % (M - len + 1);
+      if (i == j) continue;
+      int blk[3];
+      rep(t, len) blk[t] = cand[i + t];
+      cand.erase(cand.begin() + i, cand.begin() + i + len);
+      cand.insert(cand.begin() + j, blk, blk + len);
+      lo = min(i, j);
+    }
+
+    // recompute the DP suffix from dp[lo] into td[lo+1..M]
+    const int64_t *din = dp[lo].data();
+    int prev = (lo == 0) ? start_idx : basket_idx[cand[lo - 1]];
+    for (int i = lo; i < M; i++) {
+      step_job(din, prev, cand[i], td[i + 1].data());
+      din = td[i + 1].data();
+      prev = basket_idx[cand[i]];
+    }
+    Cost nxt = dp_min(td[M].data());
+
+    double diff = score_value(nxt) - score_value(cur);
+    if (diff < 0 || exp(-diff / temp) > rand01()) {
+      order.swap(cand);
+      for (int i = lo + 1; i <= M; i++) dp[i] = td[i];  // prefix [0..lo] stays valid
+      cur = nxt;
+      if (better_cost(cur, best)) { best = cur; best_order = order; }
+    }
+  }
+
+  order.swap(best_order);
+}
+
+string canon_turns(const string &s) {
+  string out;
+  out.reserve(s.size());
+  int n = s.size();
+  for (int i = 0; i < n;) {
+    char c = s[i];
+    if (c == 'R' || c == 'L') {
+      int net = 0, j = i;
+      while (j < n && (s[j] == 'R' || s[j] == 'L')) { net += (s[j] == 'R') ? 1 : 3; j++; }
+      net &= 3;
+      if (net == 1) out += 'R';
+      else if (net == 2) out += "RR";
+      else if (net == 3) out += 'L';
+      i = j;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
+string direct_path(int sb, int sa) {
+  if (sb == sa) return "";
+  int Vn = N * N * 4;
+  vector<int> par(Vn, -2);
+  vector<char> pc(Vn, 0);
+  deque<int> q;
+  par[sb] = -1;
+  q.push_back(sb);
+  while (!q.empty()) {
+    int s = q.front();
+    q.pop_front();
+    if (s == sa) break;
+    int cell = s / 4, dir = s % 4;
+    pair<int, char> nb[3] = {{cell * 4 + ((dir + 3) % 4), 'L'},
+                             {cell * 4 + ((dir + 1) % 4), 'R'},
+                             {move_tbl[cell * 4 + dir] * 4 + dir, 'F'}};
+    for (auto [t, op] : nb) {
+      if (par[t] == -2) { par[t] = s; pc[t] = op; q.push_back(t); }
+    }
+  }
+  string r;
+  for (int s = sa; s != sb; s = par[s]) r.push_back(pc[s]);
+  reverse(r.begin(), r.end());
+  return r;
+}
+
+struct MacroSearch {
+  vector<int> rel;
+  vector<int> bI, kI;
+  int sI = 0;
+  int V = 0;
+
+  void init() {
+    V = N * N * 4;
+    map<int, int> idx;
+    auto add = [&](int cell) {
+      if (!idx.count(cell)) { idx[cell] = rel.size(); rel.push_back(cell); }
+    };
+    add(0);
+    rep(i, M) { add(cell_id(ball[i])); add(cell_id(basket[i])); }
+    sI = idx[0];
+    bI.resize(M); kI.resize(M);
+    rep(i, M) { bI[i] = idx[cell_id(ball[i])]; kI[i] = idx[cell_id(basket[i])]; }
+  }
+
+  vector<int> distB, stampB, qB, Dflat;
+  vector<char> usedT; vector<int> ordT;
+  vector<char> relCell; vector<int> cellStamp;  // early-exit: per-cell relevance + visited stamp
+  int curStamp = 0, Rn = 0;
+
+  vector<int> cellToRel;
+  vector<uint16_t> vis16, acc16; vector<uint32_t> vis32, acc32; vector<uint64_t> vis64, acc64; vector<unsigned __int128> vis128, acc128;
+  vector<unsigned __int128> cellRMS;
+  vector<int> nmark; int nstamp = 0;
+  vector<int> curS, nxtS;
+
+  template<class MASK>
+  void ms_run(bool useMacro, vector<MASK> &vis, vector<MASK> &acc, vector<MASK> &cbuf, vector<MASK> &nbuf) {
+    int R = rel.size(); int NC = N * N;
+    for (int i = 0; i < R * R; i++) Dflat[i] = INF;
+    fill(vis.begin(), vis.begin() + V, (MASK)0);
+    fill(cellRMS.begin(), cellRMS.begin() + NC, (unsigned __int128)0);
+    curS.clear(); ++nstamp;
+    rep(i, R) {
+      MASK bit = (MASK)1 << i; int A = rel[i];
+      Dflat[(size_t)i * R + i] = 0; cellRMS[A] |= (unsigned __int128)bit;
+      rep(d, 4) { int sx = A * 4 + d;
+        if (nmark[sx] != nstamp) { nmark[sx] = nstamp; acc[sx] = 0; curS.push_back(sx); }
+        vis[sx] |= bit; acc[sx] |= bit;
+      }
+    }
+    int nc = curS.size();
+    rep(idx, nc) cbuf[idx] = acc[curS[idx]];
+    int layer = 0;
+    while (nc > 0) {
+      layer++; nxtS.clear(); ++nstamp; int nn = 0;
+      rep(idx, nc) {
+        int s = curS[idx]; MASK bits = cbuf[idx];
+        const int *nb = &nbr3[s * 3];
+        int outs[4] = {nb[0], nb[1], nb[2], useMacro ? macroF[s] : s};
+        int cnt = useMacro ? 4 : 3;
+        rep(k, cnt) {
+          int t = outs[k];
+          MASK add = bits & ~vis[t];
+          if (add) {
+            vis[t] |= add;
+            if (nmark[t] != nstamp) { nmark[t] = nstamp; acc[t] = 0; nxtS.push_back(t); }
+            acc[t] |= add;
+          }
+        }
+      }
+      nn = nxtS.size();
+      rep(idx, nn) {
+        int t = nxtS[idx]; MASK bits = acc[t];
+        nbuf[idx] = bits;
+        int ci = cellToRel[t >> 2];
+        if (ci < 0) continue;
+        unsigned __int128 cr = cellRMS[t >> 2];
+        MASK rec = bits & ~(MASK)cr;
+        if (!rec) continue;
+        cellRMS[t >> 2] = cr | (unsigned __int128)rec;
+        MASK r = rec;
+        while (r) {
+          int j = __builtin_ctzll((unsigned long long)r);  // R<=64 path; 128 path overrides below
+          if (sizeof(MASK) > 8) { unsigned long long lo = (unsigned long long)r; j = lo ? __builtin_ctzll(lo) : 64 + __builtin_ctzll((unsigned long long)(r >> 64)); }
+          Dflat[(size_t)j * R + ci] = layer;
+          r &= r - 1;
+        }
+      }
+      curS.swap(nxtS); swap(cbuf, nbuf); nc = nn;
+    }
+  }
+
+  void allpairs(bool useMacro) {  // multi-source bitset BFS; uint64 fast path when R<=64
+    int R = rel.size(); Rn = R; int NC = N * N;
+    if ((int)vis64.size() != V) { vis16.assign(V,0); acc16.assign(V,0); vis32.assign(V,0); acc32.assign(V,0); vis64.assign(V,0); acc64.assign(V,0); vis128.assign(V,0); acc128.assign(V,0); nmark.assign(V,0); nstamp=0; }
+    if ((int)cellRMS.size() != NC) cellRMS.assign(NC, 0);
+    if (cellToRel.empty()) { cellToRel.assign(NC, -1); rep(i, R) cellToRel[rel[i]] = i; }
+    if ((int)Dflat.size() < R * R) Dflat.resize(R * R);
+    static thread_local vector<uint16_t> cb16,nb16; static thread_local vector<uint32_t> cb32,nb32;
+    static thread_local vector<uint64_t> cb64, nb64; static thread_local vector<unsigned __int128> cb128, nb128;
+    if ((int)cb64.size() < V) { cb16.resize(V);nb16.resize(V);cb32.resize(V);nb32.resize(V);cb64.resize(V); nb64.resize(V); cb128.resize(V); nb128.resize(V); }
+    if (R <= 16) ms_run<uint16_t>(useMacro, vis16, acc16, cb16, nb16);
+    else if (R <= 32) ms_run<uint32_t>(useMacro, vis32, acc32, cb32, nb32);
+    else if (R <= 64) ms_run<uint64_t>(useMacro, vis64, acc64, cb64, nb64);
+    else ms_run<unsigned __int128>(useMacro, vis128, acc128, cb128, nb128);
+  }
+
+  long long tour() {
+    int R = Rn; const int *D = Dflat.data();
+    if ((int)usedT.size() != M) { usedT.resize(M); ordT.resize(M); }
+    char *used = usedT.data(); int *ord = ordT.data();
+    rep(k, M) used[k] = 0;
+    int cur = sI;
+    rep(t, M) {
+      int bk = -1; long long best = LLONG_MAX;
+      rep(k, M) {
+        if (used[k]) continue;
+        long long c = (long long)D[cur * R + bI[k]] + D[bI[k] * R + kI[k]];
+        if (c < best) { best = c; bk = k; }
+      }
+      used[bk] = 1; ord[t] = bk; cur = kI[bk];
+    }
+    auto edge = [&](int p) -> long long {
+      int from = (p == 0) ? sI : kI[ord[p - 1]];
+      return D[from * R + bI[ord[p]]];
+    };
+    bool improved = true; int passes = 0;
+    while (improved && passes < PROXY_TOUR_PASSES) {
+      improved = false; passes++;
+      rep(i, M) for (int j = i + 1; j < M; j++) {
+        int uniq[4], cnt = 0;
+        for (int x : {i, i + 1, j, j + 1}) {
+          if (x >= M) continue;
+          bool dup = false; rep(z, cnt) if (uniq[z] == x) dup = true;
+          if (!dup) uniq[cnt++] = x;
+        }
+        long long before = 0; rep(z, cnt) before += edge(uniq[z]);
+        swap(ord[i], ord[j]);
+        long long after = 0; rep(z, cnt) after += edge(uniq[z]);
+        if (after < before) improved = true;
+        else swap(ord[i], ord[j]);
+      }
+    }
+    long long total = 2 * M;
+    rep(t, M) total += edge(t) + D[bI[ord[t]] * R + kI[ord[t]]];
+    return total;
+  }
+
+  long long scoreMacro(const string &mac) {
+    g_macro = mac;
+    build_macro_f();
+    allpairs(true);
+    long long t = tour();
+    return t + (mac.empty() ? 0 : (long long)mac.size() + 2);
+  }
+};
+
+// Proxy macro SA: returns up to K best macros by the (cheap, facing-free) proxy score,
+// best first. "" (no macro) is the baseline and may be included.
+vector<string> proxy_search_topk(const Timer &timer, double search_end, int K,
+                                 int minLen, int maxLen) {
+  MacroSearch ms;
+  ms.init();
+  ms.allpairs(false);
+  long long base = ms.tour();
+
+  vector<pair<long long, string>> topk{{base, string("")}};
+  auto consider = [&](long long sc, const string &m) {
+    for (auto &pr : topk) if (pr.second == m) return;
+    if ((int)topk.size() < K) topk.push_back({sc, m});
+    else if (sc < topk.back().first) topk.back() = {sc, m};
+    else return;
+    sort(topk.begin(), topk.end());
+  };
+
+  const char *OPS = "FRL";
+  auto randMacro = [&](int len) { string s; rep(i, len) s += OPS[rnd() % 3]; return s; };
+  auto mutate = [&](string s) {
+    int t = rnd() % 4;
+    if (s.empty()) t = 1;
+    if (t == 0 && s.size() > 3) s[rnd() % s.size()] = OPS[rnd() % 3];
+    else if (t == 1) s += OPS[rnd() % 3];
+    else if (t == 2 && s.size() > 3) s.pop_back();
+    else { int p = rnd() % (s.size() + 1); s.insert(s.begin() + p, OPS[rnd() % 3]); }
+    return s;
+  };
+
+  // ILS: hill-climb on the macro string (accept improving only); when stuck for
+  // MACRO_KICK_STALL probes, kick from the best-so-far with several mutations.
+  string cur = randMacro(minLen + rnd() % (maxLen - minLen + 1));
+  long long curScore = ms.scoreMacro(cur);
+  consider(curScore, cur);
+  int stall = 0;
+  while (timer.ms() < search_end) {
+    string cand = canon_turns(mutate(cur));
+    if ((int)cand.size() < minLen || (int)cand.size() > maxLen) continue;
+    long long sc = ms.scoreMacro(cand);
+    consider(sc, cand);
+    if (sc < curScore) { cur = cand; curScore = sc; stall = 0; }
+    else if (++stall >= MACRO_KICK_STALL) {
+      cur = topk.front().second;  // best macro found so far
+      int nk = MACRO_KICK_LO + rnd() % MACRO_KICK_SPAN;
+      rep(z, nk) cur = mutate(cur);
+      cur = canon_turns(cur);
+      if ((int)cur.size() < minLen || (int)cur.size() > maxLen)
+        cur = randMacro(minLen + rnd() % (maxLen - minLen + 1));
+      curScore = ms.scoreMacro(cur);
+      consider(curScore, cur);
+      stall = 0;
+    }
+  }
+
+  vector<string> out;
+  for (auto &pr : topk) out.push_back(pr.second);
+  return out;
+}
+
+vector<int> held_karp_order() {
+  const int64_t BIG = (int64_t)4e18, add2 = (int64_t)2 << 32;
+  int full = 1 << M;
+  static vector<int64_t> Tt;
+  Tt.assign((size_t)M * M * 16, BIG);
+  rep(j, M) {
+    int kj = basket_idx[j];
+    rep(n, M) {
+      if (n == j) continue;
+      const int64_t *a = &cpacked[((size_t)(kj * CK + ball_idx[n])) * 16];
+      const int64_t *b = &cpacked[((size_t)(ball_idx[n] * CK + basket_idx[n])) * 16];
+      int64_t *out = &Tt[((size_t)(j * M + n)) * 16];
+      rep(d, 4) rep(nc, 4) {
+        int64_t best = BIG;
+        rep(bd, 4) { int64_t v = a[d * 4 + bd] + b[bd * 4 + nc]; if (v < best) best = v; }
+        out[d * 4 + nc] = best + add2;
+      }
+    }
+  }
+  vector<int64_t> dp((size_t)full * M * 4, BIG);
+  vector<int> par((size_t)full * M * 4, -1);
+  rep(n, M) {
+    const int64_t *a = &cpacked[((size_t)(start_idx * CK + ball_idx[n])) * 16];
+    const int64_t *b = &cpacked[((size_t)(ball_idx[n] * CK + basket_idx[n])) * 16];
+    rep(nc, 4) {
+      int64_t best = BIG;
+      rep(bd, 4) { int64_t v = a[1 * 4 + bd] + b[bd * 4 + nc]; if (v < best) best = v; }  // start faces east
+      dp[((size_t)(1 << n) * M + n) * 4 + nc] = best + add2;
+    }
+  }
+  for (int S = 1; S < full; S++) {
+    rep(j, M) {
+      if (!(S & (1 << j))) continue;
+      rep(d, 4) {
+        int64_t cur = dp[((size_t)S * M + j) * 4 + d];
+        if (cur >= BIG) continue;
+        const int64_t *Tj = &Tt[((size_t)(j * M)) * 16];
+        rep(n, M) {
+          if (S & (1 << n)) continue;
+          const int64_t *t = &Tj[(size_t)n * 16 + d * 4];
+          int nS = S | (1 << n);
+          rep(nc, 4) {
+            int64_t v = cur + t[nc];
+            size_t ni = ((size_t)nS * M + n) * 4 + nc;
+            if (v < dp[ni]) { dp[ni] = v; par[ni] = j * 4 + d; }
+          }
+        }
+      }
+    }
+  }
+  int64_t best = BIG; int bj = 0, bd = 0;
+  rep(j, M) rep(d, 4) {
+    int64_t v = dp[((size_t)(full - 1) * M + j) * 4 + d];
+    if (v < best) { best = v; bj = j; bd = d; }
+  }
+  vector<int> order;
+  int S = full - 1, j = bj, d = bd;
+  while (true) {
+    order.push_back(j);
+    int p = par[((size_t)S * M + j) * 4 + d];
+    S ^= (1 << j);
+    if (p < 0) break;
+    j = p / 4; d = p % 4;
+  }
+  reverse(order.begin(), order.end());
+  return order;
+}
+
+string solve_with_macro(const string &m, const Timer &timer, double end_ms, vector<int> &order) {
+  g_macro = canon_turns(m);
+  build_macro_f();
+  build_required_paths();
+  build_compact_costs();
+  if (M <= MAX_EXACT_M) {
+    order = held_karp_order();  // exact optimal order; no SA needed
+  } else {
+    if (order.empty()) order = greedy_order();  // else warm-start from the carried order
+    optimize_order(order, timer, end_ms);
+  }
+  string raw = build_raw_answer(order);
+
+  string ans;
+  if (macroLen > 0 && raw.find('P') != string::npos) {
+
+    struct PInfo { int pos, sb, sa, dl; string direct; };
+    vector<PInfo> ps;
+    long long execNonP = 0;
+    {
+      int cell = 0, dir = 1;
+      rep(i, (int)raw.size()) {
+        char ch = raw[i];
+        int s = cell * 4 + dir;
+        if (ch == 'P') {
+          int sa = macroF[s];
+          ps.push_back({i, s, sa, 0, ""});
+          cell = sa / 4; dir = sa % 4;
+        } else {
+          if (ch == 'F') cell = move_tbl[s];
+          else if (ch == 'R') dir = (dir + 1) % 4;
+          else if (ch == 'L') dir = (dir + 3) % 4;
+          execNonP += 1;
+        }
+      }
+    }
+    int numP = ps.size();
+    for (auto &p : ps) { p.direct = direct_path(p.sb, p.sa); p.dl = p.direct.size(); }
+    long long exec = execNonP + (long long)macroLen * numP;
+
+    vector<char> repl(numP, 0);
+    if (exec > (long long)T) {
+      vector<int> ord(numP);
+      iota(ord.begin(), ord.end(), 0);
+      auto eff = [&](int i) {
+        int saved = macroLen - ps[i].dl;
+        int cost = max(1, ps[i].dl - 1);
+        return (double)saved / cost;
+      };
+      sort(ord.begin(), ord.end(), [&](int a, int b) { return eff(a) > eff(b); });
+      for (int i : ord) {
+        if (exec <= (long long)T) break;
+        int saved = macroLen - ps[i].dl;
+        if (saved <= 0) continue;
+        repl[i] = 1;
+        exec -= saved;
+      }
+      if (exec > (long long)T)
+        for (int i = 0; i < numP; i++) repl[i] = 1;
+    }
+
+    int firstKeep = -1;
+    rep(i, numP) if (!repl[i]) { firstKeep = i; break; }
+
+    ans.reserve(raw.size() + macroLen + 2);
+    int pj = 0;
+    rep(i, (int)raw.size()) {
+      if (pj < numP && ps[pj].pos == i) {
+        if (repl[pj]) ans += ps[pj].direct;
+        else if (pj == firstKeep) { ans += 'M'; ans += g_macro; ans += 'M'; }
+        else ans += 'P';
+        pj++;
+      } else {
+        ans += raw[i];
+      }
+    }
+  } else {
+    ans = raw;
+  }
+
+  ans = canon_turns(ans);
+  return ans;
+}
+
+int main() {
+  ios::sync_with_stdio(false);
+  cin.tie(nullptr);
+
+  Timer timer;
+  cin >> N >> M >> T;
+  vw.resize(N);
+  hw.resize(N - 1);
+  rep(i, N) cin >> vw[i];
+  rep(i, N - 1) cin >> hw[i];
+
+  ball.resize(M);
+  basket.resize(M);
+  rep(i, M) cin >> ball[i].r >> ball[i].c >> basket[i].r >> basket[i].c;
+
+  build_move_table();
+
+  // Small M: order is solved exactly (Held-Karp). Phase A scores many macros with the
+  // cheap proxy (collect top-K); phase B exact-solves them best-first and keeps the best.
+  if (M <= MAX_EXACT_M) {
+    const double usable = TIME_LIMIT_MS - MARGIN_MS;
+    vector<string> cands = proxy_search_topk(timer, usable * EXACT_PROXY_FRAC, EXACT_TOPK,
+                                             SMALL_MACRO_MIN_LEN, SMALL_MACRO_MAX_LEN);
+    vector<int> dummy;
+    string best = solve_with_macro("", timer, usable, dummy);  // no-macro baseline
+    for (auto &m : cands) {
+      if (m.empty() || timer.ms() >= usable) continue;
+      string a = solve_with_macro(m, timer, usable, dummy);
+      if (a.size() < best.size()) best = a;
+    }
+    for (char op : best) cout << op << '\n';
+    return 0;
+  }
+
+  const double usable = TIME_LIMIT_MS - MARGIN_MS;
+  const double sum = PH_MACRO + PH_ORDER;
+  const double mphase = usable * (PH_MACRO / sum);
+  vector<string> cands = proxy_search_topk(timer, mphase, LARGE_TOPK,
+                                           MACRO_MIN_LEN, MACRO_MAX_LEN);
+  int K = cands.size();
+  double slice = (usable - mphase) / max(1, K);
+  string best;
+  rep(i, K) {
+    double we = mphase + (i + 1) * slice;
+    vector<int> oo;
+    string a = solve_with_macro(cands[i], timer, we, oo);
+    if (best.empty() || a.size() < best.size()) best = a;
+  }
+
+  for (char op : best) cout << op << '\n';
+  return 0;
+}
